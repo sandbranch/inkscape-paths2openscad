@@ -1,6 +1,38 @@
 paths2openscad
 ==============
 
+> **This fork (branch `inkscape-1.4`) works in Inkscape 1.4.** The last
+> upstream release (v0.27, 2020) predates Inkscape 1.0 and crashes in
+> 1.4 (upstream issue #25); master was ported to 1.0 but never released,
+> and still had these bugs, all fixed here:
+>
+> * crashed at start with Python 3.14 (a bare `%` in a help text), and
+>   on any XML comment in the drawing;
+> * documents without a viewBox (px documents) came out 3.78 times too
+>   big; line widths in outline mode were wrong in px and scaled
+>   documents. Sizes now come from inkex, so mm, px and scaled
+>   documents all give the drawing's size in mm;
+> * rects ignored rounded corners and crashed without an `x`; lines
+>   touching 0 were dropped (shapes now go through inkex);
+> * with `fill-rule:nonzero`, a subpath inside another one winding the
+>   same way became a hole; it is filled now, as Inkscape shows it;
+> * clones (`<use>`) of one object: only the last one was output
+>   (upstream issue #9); hidden groups with more than `display:none` in
+>   their style were output;
+> * `{NAME}.scad` was written into the extension folder (Inkscape makes
+>   the path parameter absolute there), now next to the drawing
+>   (upstream issue #24);
+> * command line defaults now match the .inx (chamfer 0, line width
+>   scale 100 %).
+>
+> Tests: `python3 -m pytest tests/` (needs inkex 1.4; the STL checks
+> also need `openscad`). Install: `dev/install.sh` symlinks
+> `paths2openscad.inx` and `paths2openscad.py` into
+> `~/.config/inkscape/extensions/paths2openscad/`; on Windows or macOS
+> copy those two files into the folder shown under Edit > Preferences >
+> System > User extensions. Menu: Extensions > Generate from Path >
+> Paths to OpenSCAD.
+
 [![Downloads](https://img.shields.io/github/downloads/fablabnbg/inkscape-paths2openscad/total.svg?maxAge=2592000?style=flat-square)](https://github.com/fablabnbg/inkscape-paths2openscad/releases/latest)
 [![GitHub release](https://img.shields.io/github/release/fablabnbg/inkscape-paths2openscad.svg)](https://github.com/fablabnbg/paths2openscad/releases)
 [![Build Status](https://travis-ci.org/fablabnbg/inkscape-paths2openscad.svg?branch=master)](https://travis-ci.org/fablabnbg/inkscape-paths2openscad)

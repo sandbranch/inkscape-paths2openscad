@@ -121,6 +121,7 @@ import inkex.localization
 import inkex.paths
 import inkex.bezier
 from inkex.transforms import Transform
+import math
 import re
 import time
 import string
@@ -166,7 +167,7 @@ def IsProcessRunning(pid):
             shell=True,
             stdout=subprocess.PIPE,
         )
-        output = ps.stdout.read()
+        output = ps.stdout.read().decode("utf-8", "replace")
         ps.stdout.close()
         ps.wait()
         if str(pid) in output:
@@ -180,33 +181,6 @@ def IsProcessRunning(pid):
             return True
         except OSError:
             return False
-
-
-def parseLengthWithUnits(str, default_unit="px"):
-    """
-    Parse an SVG value which may or may not have units attached
-    This version is greatly simplified in that it only allows: no units,
-    units of px, and units of %.  Everything else, it returns None for.
-    There is a more general routine to consider in scour.py if more
-    generality is ever needed.
-    With inkscape 0.91 we need other units too: e.g. svg:width="400mm"
-    """
-
-    u = default_unit
-    s = str.strip()
-    if s[-2:] in ("px", "pt", "pc", "mm", "cm", "in", "ft"):
-        u = s[-2:]
-        s = s[:-2]
-    elif s[-1:] in ("m", "%"):
-        u = s[-1:]
-        s = s[:-1]
-
-    try:
-        v = float(s)
-    except Exception:
-        return None, None
-
-    return v, u
 
 
 def pointInBBox(pt, bbox):
@@ -335,6 +309,45 @@ def polyInPoly(poly1, bbox1, poly2, bbox2):
     return True
 
 
+def signedArea(poly):
+    """Twice the signed area of polygon poly = [[x1,y1],[x2,y2],...]."""
+    a = 0.0
+    n = len(poly)
+    for k in range(n):
+        x1, y1 = poly[k - 1][0], poly[k - 1][1]
+        x2, y2 = poly[k][0], poly[k][1]
+        a += x1 * y2 - x2 * y1
+    return a
+
+
+def dropNonzeroInnerSubpaths(path):
+    """
+    With fill-rule:nonzero a subpath inside another one is only a hole when
+    the winding number changes between zero and non-zero across it (fonts
+    wind holes the other way). Drop nested subpaths that do not change
+    whether the area is filled, so the even-odd nesting used for the
+    OpenSCAD polygon gives the same result as nonzero.
+
+    path is a list of [vertices, bbox] as built by getPathVertices().
+    """
+    n = len(path)
+    if n < 2:
+        return path
+    dirs = []
+    for sub, bbox in path:
+        a = signedArea(sub)
+        dirs.append(0 if a == 0 else (1 if a > 0 else -1))
+    keep = []
+    for j in range(n):
+        outside = 0
+        for i in range(n):
+            if i != j and polyInPoly(path[j][0], path[j][1], path[i][0], path[i][1]):
+                outside += dirs[i]
+        if (outside != 0) != (outside + dirs[j] != 0):
+            keep.append(path[j])
+    return keep
+
+
 def subdivideCubicPath(sp, flat, i=1):
     """
     [ Lifted from eggbot.py with impunity ]
@@ -446,7 +459,7 @@ class OpenSCAD(inkex.Effect):
             "--chamfer",
             dest="chamfer",
             type=float,
-            default=float(1.),
+            default=float(0.),
             action="store",
             help="Add a chamfer radius, displacing all object walls outwards [mm]",
         )
@@ -482,9 +495,9 @@ class OpenSCAD(inkex.Effect):
             "--line_width_scale_perc",
             dest="line_width_scale_perc",
             type=float,
-            default=float(1),
+            default=float(100),
             action="store",
-            help="Percentage of SVG line width. Use e.g. 26.46 to compensate a px/mm confusion. Default: 100 [%]",
+            help="Percentage of SVG line width. Use e.g. 26.46 to compensate a px/mm confusion. Default: 100 [%%]",
         )
 
         self.arg_parser.add_argument(
@@ -578,17 +591,14 @@ class OpenSCAD(inkex.Effect):
 
         self.userunitsx = 1.0  # Move to pure userunits per mm for v1.0
         self.userunitsy = 1.0
-        self.px_used = False  # raw px unit depends on correct dpi.
         self.cx = float(DEFAULT_WIDTH) / 2.0
         self.cy = float(DEFAULT_HEIGHT) / 2.0
         self.xmin, self.xmax = (1.0E70, -1.0E70)
         self.ymin, self.ymax = (1.0E70, -1.0E70)
 
-        # Dictionary of paths we will construct.  It's keyed by the SVG node
-        # it came from.  Such keying isn't too useful in this specific case,
-        # but it can be useful in other applications when you actually want
-        # to go back and update the SVG document
-        self.paths = {}
+        # List of (SVG node, subpaths, stroke scale) we will output.
+        self.paths = []
+        self.used_ids = set()
 
         # Output file handling
         self.call_list = []
@@ -610,96 +620,47 @@ class OpenSCAD(inkex.Effect):
         # multiple times about the same problem
         self.warnings = {}
 
-    def getLength(self, name, default):
-
-        """
-        Get the <svg> attribute with name "name" and default value "default"
-        Parse the attribute into a value and associated units.  Then, accept
-        units of cm, ft, in, m, mm, pc, or pt.  Convert to pixels.
-
-        Note that SVG defines 90 px = 1 in = 25.4 mm.
-        Note: Since inkscape 0.92 we use the CSS standard of 96 px = 1 in.
-        """
-        str = self.document.getroot().get(name)
-        if str:
-            return self.LengthWithUnit(str)
-        else:
-            # No width specified; assume the default value
-            return float(default)
-
-    def LengthWithUnit(self, strn, default_unit="px"):
-        v, u = parseLengthWithUnits(strn, default_unit)
-        if v is None:
-            # Couldn't parse the value
-            return None
-        elif u == "mm":
-            return float(v) * (self.userunitsx)
-        elif u == "cm":
-            return float(v) * (self.userunitsx * 10.0)
-        elif u == "m":
-            return float(v) * (self.userunitsx * 1000.0)
-        elif u == "in":
-            return float(v) * self.userunitsx * 25.4
-        elif u == "ft":
-            return float(v) * 12.0 * self.userunitsx * 25.4
-        elif u == "pt":
-            # Use modern "Postscript" points of 72 pt = 1 in instead
-            # of the traditional 72.27 pt = 1 in
-            return float(v) * (self.userunitsx * 25.4 / 72.0)
-        elif u == "pc":
-            return float(v) * (self.userunitsx * 25.4 / 6.0)
-        elif u == "px":
-            self.px_used = True
-            return float(v)
-        else:
-            # Unsupported units
-            return None
-
     def getDocProps(self):
         """
-        Get the document's height and width attributes from the <svg> tag.
-        Use a default value in case the property is not present or is
-        expressed in units of percentages.
+        Find the document name (used for {NAME} in the output file name) and
+        the folder the document lives in (relative output file names are
+        resolved against it).
         """
         self.inkscape_version = self.document.getroot().get(
             "{http://www.inkscape.org/namespaces/inkscape}version"
         )
-        sodipodi_docname = self.document.getroot().get(
-            "{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}docname"
-        )
-        if sodipodi_docname is None:
-            sodipodi_docname = "inkscape"
-            # the document was not saved. We can assume it is v1 inkscape
-        self.basename = re.sub(r"\.SVG", "", sodipodi_docname, flags=re.I)
-        self.docHeight = self.getLength("height", DEFAULT_HEIGHT)
-        self.docWidth = self.getLength("width", DEFAULT_WIDTH)
-
-        if (self.docHeight is None) or (self.docWidth is None):
-            return False
+        # Inkscape 1.1 and later tell extensions where the document is saved
+        # (empty when it was never saved). The input file inkex gets is only
+        # a temporary copy.
+        docpath = self.document_path()
+        if docpath:
+            self.basename = os.path.splitext(os.path.basename(docpath))[0]
+            self.docdir = os.path.dirname(os.path.abspath(docpath))
         else:
-            return True
+            sodipodi_docname = self.document.getroot().get(
+                "{http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd}docname"
+            )
+            if sodipodi_docname is None:
+                # the document was not saved.
+                sodipodi_docname = "inkscape"
+            self.basename = re.sub(r"\.SVG$", "", sodipodi_docname, flags=re.I)
+            # The working directory of an extension is the extension
+            # folder, never write there (upstream issue #24).
+            self.docdir = os.environ.get("PWD") or os.path.expanduser("~")
 
     def handleViewBox(self):
         """
-        Set up the document-wide transform in the event that the document has
-        an SVG viewbox, which it should as of v1.0
-        For details, see https://wiki.inkscape.org/wiki/index.php/Units_In_Inkscape
+        Set up the document-wide transform from user units to millimeters.
+        inkex knows about width, height and viewBox (and their units), so
+        mm, px and scaled documents all come out at their real size.
         """
-
-        if self.getDocProps():
-            viewbox = self.document.getroot().get("viewBox")
-            if viewbox:
-                vinfo = viewbox.strip().replace(",", " ").split()
-                vinfo = [float(i) for i in vinfo]
-                unitsx = abs(vinfo[0] - vinfo[2])
-                # unitsy = abs(vinfo[1] - vinfo[3])
-                self.userunitsx = self.docWidth / unitsx
-                # The above wiki page suggests that x and y scaling maybe different
-                # however in practice they are not
-                self.userunitsy = self.userunitsx
-                self.docTransform = Transform(
-                    "scale(%f,%f)" % (self.userunitsx, self.userunitsy)
-                )
+        self.getDocProps()
+        uu_per_mm = self.svg.viewport_to_unit("1mm")
+        if not uu_per_mm:
+            uu_per_mm = self.svg.to_dimensionless("1mm")
+        self.userunitsx = 1.0 / uu_per_mm
+        self.userunitsy = self.userunitsx
+        self.docTransform = Transform(scale=(self.userunitsx, self.userunitsy))
 
     def getPathVertices(self, path, node=None, transform=None):
         """
@@ -787,27 +748,14 @@ class OpenSCAD(inkex.Effect):
             )
 
         if len(subpath_list) > 0:
-            self.paths[node] = subpath_list
+            # Stroke widths scale with the square root of the determinant
+            # of the transform (which includes user units to mm).
+            scale = math.sqrt(abs(transform.a * transform.d - transform.b * transform.c)) if transform else 1.0
+            # A list, not a dict keyed by node: a node used by several
+            # clones (<use>) must be output once per use (upstream issue #9).
+            self.paths.append((node, subpath_list, scale))
 
-    def getPathStyle(self, node):
-        style = node.get("style", "")
-        # .get default is not reliable, ensure value is a string
-        if not style:
-            style = ""
-        ret = {}
-        # fill:none;fill-rule:evenodd;stroke:#000000;stroke-width:10;stroke-linecap:butt;stroke-linejoin:miter;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1
-        for elem in style.split(";"):
-            if len(elem):
-                try:
-                    (key, val) = elem.strip().split(":")
-                except Exception:
-                    inkex.errormsg(
-                        "unparsable element '{1}' in style '{0}'".format(elem, style)
-                    )
-                ret[key] = val
-        return ret
-
-    def convertPath(self, node):
+    def convertPath(self, node, path, stroke_scale=1.0):
         def object_merge_extrusion_values(extrusion, node):
 
             """ Parser for description and ID fields for extrusion parameters.
@@ -827,7 +775,7 @@ class OpenSCAD(inkex.Effect):
             # let description contents override id contents.
             for tagname in DESC_TAGS:
                 desc_node = node.find("./%s" % tagname)
-                if desc_node is not None:
+                if desc_node is not None and desc_node.text:
                     zsize = RE_AUTO_ZSIZE_DESC.findall(desc_node.text)
                     if zsize:
                         extrusion["zsize"] = zsize[-1]
@@ -845,9 +793,12 @@ class OpenSCAD(inkex.Effect):
                 extrusion["zsize"] = extrusion["zsize"][1:]
             # END object_merge_extrusion_values
 
-        path = self.paths[node]
         if (path is None) or (len(path) == 0):
             return
+
+        style = node.specified_style()
+        if style.get("fill-rule", "nonzero") == "nonzero":
+            path = dropNonzeroInnerSubpaths(path)
 
         # Determine which polys contain which
 
@@ -875,19 +826,31 @@ class OpenSCAD(inkex.Effect):
             self.pathid += 1
         else:
             id = re.sub("[^A-Za-z0-9_]+", "", rawid)
+        # OpenSCAD names cannot start with a digit; clones reuse an id.
+        if not id or id[0].isdigit():
+            id = "p" + id
+        base_id = id
+        n = 2
+        while id in self.used_ids:
+            id = "%s_%d" % (base_id, n)
+            n += 1
+        self.used_ids.add(id)
 
-        style = self.getPathStyle(node)
-        stroke_width = style.get("stroke-width", "1")
-
-        # FIXME: works with document units == 'mm', but otherwise untested..
-        stroke_width_mm = self.LengthWithUnit(stroke_width, default_unit="mm")
-        stroke_width_mm = str(stroke_width_mm * self.userunitsx)  # px to mm
-        fill_color = style.get("fill", "#FFF")
-        if fill_color == "none":
+        # stroke-width is in the element's own user units (CSS units are
+        # relative to them, 1px = 1 user unit); stroke_scale takes it to mm.
+        stroke_width = style.get("stroke-width", "1") or "1"
+        try:
+            stroke_width_uu = self.svg.to_dimensionless(stroke_width)
+        except Exception:
+            stroke_width_uu = 1.0
+        stroke_width_mm = "%g" % (stroke_width_uu * stroke_scale)
+        fill_color = style.get("fill", "black")
+        if fill_color is None or str(fill_color) == "none":
             filled = False
         else:
             filled = True
-        if filled is False and style.get("stroke", "none") == "none":
+        stroke_color = style.get("stroke", "none")
+        if filled is False and (stroke_color is None or str(stroke_color) == "none"):
             inkex.errormsg(
                 "WARNING: " + rawid + " has fill:none and stroke:none, object ignored."
             )
@@ -1047,6 +1010,11 @@ class OpenSCAD(inkex.Effect):
 
         for node in aNodeList:
 
+            if not isinstance(node.tag, (str, bytes)):
+                # XML comments and processing instructions. lxml uses a
+                # function reference for such node tags.
+                continue
+
             # Ignore invisible nodes
             v = node.get("visibility", parent_visibility)
             if v == "inherit":
@@ -1054,12 +1022,14 @@ class OpenSCAD(inkex.Effect):
             if v == "hidden" or v == "collapse":
                 continue
 
-            s = node.get("style", "")
-            if s == "display:none":
-                continue
+            try:
+                if node.style.get("display", "") == "none":
+                    continue
+            except AttributeError:
+                pass
 
             # First apply the current matrix transform to this node's transform
-            matNew = matCurrent * Transform(node.get("transform"))
+            matNew = matCurrent @ Transform(node.get("transform"))
 
             if node.tag == inkex.addNS("g", "svg") or node.tag == "g":
 
@@ -1082,7 +1052,7 @@ class OpenSCAD(inkex.Effect):
                 #     referenced element is hidden only if its visibility is
                 #     "inherit" or "hidden".
 
-                refid = node.get(inkex.addNS("href", "xlink"))
+                refid = node.get(inkex.addNS("href", "xlink")) or node.get("href")
                 if not refid:
                     continue
 
@@ -1094,7 +1064,7 @@ class OpenSCAD(inkex.Effect):
                     y = float(node.get("y", "0"))
                     # Note: the transform has already been applied
                     if (x != 0) or (y != 0):
-                        matNew2 = matNew * Transform("translate(%f,%f)" % (x, y))
+                        matNew2 = matNew @ Transform(translate=(x, y))
                     else:
                         matNew2 = matNew
                     v = node.get("visibility", v)
@@ -1106,133 +1076,30 @@ class OpenSCAD(inkex.Effect):
                 if path_data:
                     self.getPathVertices(path_data, node, matNew)
 
-            elif node.tag == inkex.addNS("rect", "svg") or node.tag == "rect":
+            elif getattr(node, "TAG", None) in ("rect", "line", "polyline", "polygon", "circle", "ellipse"):
 
-                # Manually transform
-                #
-                #    <rect x="X" y="Y" width="W" height="H"/>
-                #
-                # into
-                #
-                #    <path d="MX,Y lW,0 l0,H l-W,0 z"/>
-                #
-                # I.e., explicitly draw three sides of the rectangle and the
-                # fourth side implicitly
-
-                # Create a path with the outline of the rectangle
-                x = float(node.get("x"))
-                y = float(node.get("y"))
-                w = float(node.get("width", "0"))
-                h = float(node.get("height", "0"))
-                a = []
-                a.append(["M", [x, y]])
-                a.append(["l", [w, 0]])
-                a.append(["l", [0, h]])
-                a.append(["l", [-w, 0]])
-                a.append(["Z", []])
-                self.getPathVertices(a, node, matNew)
-
-            elif node.tag == inkex.addNS("line", "svg") or node.tag == "line":
-
-                # Convert
-                #
-                #   <line x1="X1" y1="Y1" x2="X2" y2="Y2/>
-                #
-                # to
-                #
-                #   <path d="MX1,Y1 LX2,Y2"/>
-
-                x1 = float(node.get("x1"))
-                y1 = float(node.get("y1"))
-                x2 = float(node.get("x2"))
-                y2 = float(node.get("y2"))
-                if (not x1) or (not y1) or (not x2) or (not y2):
-                    continue
-                a = []
-                a.append(["M", [x1, y1]])
-                a.append(["L", [x2, y2]])
-                self.getPathVertices(a, node, matNew)
-
-            elif node.TAG in ["polygon", "polyline"]:
-
-                # Convert
-                #
-                #  <polyline points="x1,y1 x2,y2 x3,y3 [...]"/>
-                #
-                # to
-                #
-                #   <path d="Mx1,y1 Lx2,y2 Lx3,y3 [...]"/>
-                #
-                # Note: we ignore polylines with no points
-
-                pl = node.get("points", "").strip()
-                if not pl:
-                    continue
-
-                pa = pl.split()
-                d = "".join(
-                    [
-                        "M " + pa[i] if i == 0 else " L " + pa[i]
-                        for i in range(0, len(pa))
-                    ]
-                )
-                d = []
-                first = True
-                for part in pl.split():
-                    x, y = part.split(",")
-                    coords = [float(x), float(y)]
-                    if first:
-                        d.append(["M", coords])
-                        first = False
+                # Let inkex turn the shape into a path. It knows the SVG
+                # defaults (a missing x or y is 0, rounded rect corners,
+                # lines and shapes touching 0).
+                try:
+                    if node.TAG in ("circle", "ellipse"):
+                        # Two half arcs from the left to the right end, so
+                        # the flattened outline keeps the exact width and
+                        # height of the shape.
+                        rx, ry = node.rxry()
+                        cx, cy = node.center
+                        if rx <= 0 or ry <= 0:
+                            continue
+                        shape_path = inkex.paths.Path(
+                            "M %r,%r A %r,%r 0 1 0 %r,%r A %r,%r 0 1 0 %r,%r Z"
+                            % (cx - rx, cy, rx, ry, cx + rx, cy, rx, ry, cx - rx, cy)
+                        )
                     else:
-                        d.append(["L", coords])
-                if node.TAG == "polygon":
-                    d.append(["Z", []])
-                self.getPathVertices(d, node, matNew)
-
-            elif (
-                node.tag == inkex.addNS("ellipse", "svg")
-                or node.tag == "ellipse"
-                or node.tag == inkex.addNS("circle", "svg")
-                or node.tag == "circle"
-            ):
-
-                # Convert circles and ellipses to a path with two 180 degree
-                # arcs. In general (an ellipse), we convert
-                #
-                #   <ellipse rx="RX" ry="RY" cx="X" cy="Y"/>
-                #
-                # to
-                #
-                #   <path d="MX1,CY A RX,RY 0 1 0 X2,CY A RX,RY 0 1 0 X1,CY"/>
-                #
-                # where
-                #
-                #   X1 = CX - RX
-                #   X2 = CX + RX
-                #
-                # Note: ellipses or circles with a radius attribute of value 0
-                # are ignored
-
-                if node.tag == inkex.addNS("ellipse", "svg") or node.tag == "ellipse":
-                    rx = float(node.get("rx", "0"))
-                    ry = float(node.get("ry", "0"))
-                else:
-                    rx = float(node.get("r", "0"))
-                    ry = rx
-                if rx == 0 or ry == 0:
-                    continue
-
-                cx = float(node.get("cx", "0"))
-                cy = float(node.get("cy", "0"))
-                x1 = cx - rx
-                x2 = cx + rx
-                d = [
-                    ["M", (x1, cy)],
-                    ["A", (rx, ry, 0, 1, 0, x2, cy)],
-                    ["A", (rx, ry, 0, 1, 0, x1, cy)],
-                ]
-                self.getPathVertices(d, node, matNew)
+                        shape_path = node.path
+                except Exception:
+                    shape_path = None
+                if shape_path is not None and len(shape_path) > 0:
+                    self.getPathVertices(shape_path, node, matNew)
 
             elif node.tag == inkex.addNS("pattern", "svg") or node.tag == "pattern":
                 pass
@@ -1262,7 +1129,7 @@ class OpenSCAD(inkex.Effect):
                     if tnode is not None and tnode.text is not None:
                         texts.append(tnode.text)
                 if len(texts):
-                    plaintext = "', '".join(texts).encode("latin-1")
+                    plaintext = "', '".join(texts)
                     inkex.errormsg('Warning: text "%s"' % plaintext)
                     inkex.errormsg(
                         "Warning: unable to draw text, please convert it to a path first."
@@ -1347,7 +1214,7 @@ class OpenSCAD(inkex.Effect):
                 if parent_transform is None:
                     return tr
                 else:
-                    return parent_transform * tr
+                    return parent_transform @ tr
         else:
             return self.docTransform
 
@@ -1376,13 +1243,19 @@ class OpenSCAD(inkex.Effect):
         # Determine which polygons lie entirely within other polygons
         try:
             self.options.fname = self.options.fname.format(**{"NAME": self.basename})
-            if os.sep not in self.options.fname and "PWD" in os.environ:
-                # current working directory of an extension seems to be the extension dir.
-                # Workaround using PWD, if available...
-                self.options.fname = os.environ["PWD"] + "/" + self.options.fname
             scad_fname = os.path.expanduser(self.options.fname)
             if "/" != os.sep:
                 scad_fname = scad_fname.replace("/", os.sep)
+            # Relative names go next to the drawing, not into the extension
+            # folder (upstream issue #24). Inkscape itself turns a relative
+            # name in a path parameter into one in the extension folder,
+            # so such names count as relative too.
+            here = os.path.dirname(os.path.abspath(__file__))
+            ext_dirs = {here, os.path.realpath(here)}
+            if os.path.isabs(scad_fname) and os.path.dirname(scad_fname) in ext_dirs:
+                scad_fname = os.path.basename(scad_fname)
+            if not os.path.isabs(scad_fname):
+                scad_fname = os.path.join(self.docdir, scad_fname)
             self.f = open(scad_fname, "w")
 
             self.f.write(
@@ -1429,13 +1302,12 @@ fudge = 0.1;
                 "line_width_scale = %s;\n" % (self.options.line_width_scale_perc * 0.01)
             )
             self.f.write(
-                "function min_line_mm(w) = max(min_line_width, w * line_width_scale) * %g;\n\n"
-                % self.userunitsx
+                "function min_line_mm(w) = max(min_line_width, w * line_width_scale);\n\n"
             )
 
-            for key in self.paths:
+            for node, path, stroke_scale in self.paths:
                 self.f.write("\n")
-                self.convertPath(key)
+                self.convertPath(node, path, stroke_scale)
 
             if self.options.chamfer:
                 self.f.write(
@@ -1607,13 +1479,13 @@ module chamfer_sphere(rad=chamfer, res=chamfer_fn)
 
                 stdout, stderr = proc.communicate()
                 if stdout or stderr:
-                    inkex.errmsg("CMD: {}".format(cmd))
+                    inkex.errormsg("CMD: {}".format(cmd))
                     inkex.errormsg("= " * 24)
                 if stdout:
-                    inkex.errmsg("STDOUT: {}".format(stdout))
+                    inkex.errormsg("STDOUT: {}".format(stdout))
                     inkex.errormsg("= " * 24)
                 if stderr:
-                    inkex.errmsg("STDERR: {}".format(stderr))
+                    inkex.errormsg("STDERR: {}".format(stderr))
                     inkex.errormsg("= " * 24)
 
 

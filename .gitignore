@@ -2,3 +2,5 @@ build/
 download/
 virtualenv
 virtualenv*/
+__pycache__/
+.pytest_cache/
